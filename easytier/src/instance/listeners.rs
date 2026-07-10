@@ -1,6 +1,6 @@
 use std::{
     fmt::Debug,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     str::FromStr,
     sync::{Arc, Weak},
     time::Duration,
@@ -9,22 +9,25 @@ use std::{
 use anyhow::Context;
 use async_trait::async_trait;
 use tokio::task::JoinSet;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::{
     common::{
         error::Error,
         global_ctx::{ArcGlobalCtx, GlobalCtxEvent},
         netns::NetNS,
-        stun::StunInfoCollectorTrait,
     },
     peers::peer_manager::PeerManager,
-    proto::common::TunnelInfo,
+    proto::common::NatType,
     tunnel::{
         self, IpScheme, Tunnel, TunnelListener, TunnelScheme, ring::RingTunnelListener,
         tcp::TcpTunnelListener, udp::UdpTunnelListener,
     },
     utils::BoxExt,
 };
+
+#[cfg(feature = "websocket")]
+use crate::common::stun::StunInfoCollectorTrait;
 
 pub fn create_listener_by_url(
     l: &url::Url,
@@ -88,103 +91,191 @@ pub fn is_url_host_unspecified(l: &url::Url) -> bool {
     }
 }
 
+const WS_STUN_MAPPING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+const WS_STUN_MAPPING_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+fn tcp_nat_supports_public_listener(nat_type: NatType) -> bool {
+    matches!(
+        nat_type,
+        NatType::OpenInternet | NatType::NoPat | NatType::FullCone
+    )
+}
+
+struct DynamicMappedListenerRegistration {
+    global_ctx: ArcGlobalCtx,
+    scheme: String,
+    local_port: u16,
+    current: Option<(url::Url, u64)>,
+}
+
+impl DynamicMappedListenerRegistration {
+    fn new(global_ctx: ArcGlobalCtx, scheme: String, local_port: u16) -> Self {
+        Self {
+            global_ctx,
+            scheme,
+            local_port,
+            current: None,
+        }
+    }
+
+    fn update(&mut self, mapped_addr: Option<SocketAddr>) {
+        let Some(mapped_addr) = mapped_addr else {
+            self.clear();
+            return;
+        };
+        let mapped_url = tunnel::build_url_from_socket_addr(&mapped_addr.to_string(), &self.scheme);
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|(current_url, _)| current_url == &mapped_url)
+        {
+            return;
+        }
+
+        let generation = self.global_ctx.add_dynamic_mapped_listener_for_port(
+            &self.scheme,
+            self.local_port,
+            mapped_url.clone(),
+        );
+        tracing::info!(
+            local_port = self.local_port,
+            ?mapped_addr,
+            mapped_url = %mapped_url,
+            scheme = %self.scheme,
+            "websocket STUN mapping advertised"
+        );
+        self.current = Some((mapped_url, generation));
+    }
+
+    fn clear(&mut self) {
+        let Some((mapped_url, generation)) = self.current.take() else {
+            return;
+        };
+        self.global_ctx
+            .remove_dynamic_mapped_listener_for_port_if_generation(
+                &self.scheme,
+                self.local_port,
+                &mapped_url,
+                generation,
+            );
+        tracing::info!(
+            local_port = self.local_port,
+            mapped_url = %mapped_url,
+            scheme = %self.scheme,
+            "websocket STUN mapping withdrawn"
+        );
+    }
+}
+
+impl Drop for DynamicMappedListenerRegistration {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+fn spawn_ws_stun_mapping_lease(
+    global_ctx: ArcGlobalCtx,
+    listener: url::Url,
+) -> Option<AbortOnDropHandle<()>> {
+    #[cfg(not(feature = "websocket"))]
+    {
+        let _ = (global_ctx, listener);
+        None
+    }
+
+    #[cfg(feature = "websocket")]
+    {
+        if !matches!(listener.scheme(), "ws" | "wss") || is_url_host_ipv6(&listener) {
+            return None;
+        }
+        let local_port = listener.port()?;
+        let scheme = listener.scheme().to_string();
+        let task = tokio::spawn(async move {
+            let mut registration = DynamicMappedListenerRegistration::new(
+                global_ctx.clone(),
+                scheme.clone(),
+                local_port,
+            );
+
+            loop {
+                let tcp_nat_type = NatType::try_from(
+                    global_ctx
+                        .get_stun_info_collector()
+                        .get_stun_info()
+                        .tcp_nat_type,
+                )
+                .unwrap_or(NatType::Unknown);
+                if !tcp_nat_supports_public_listener(tcp_nat_type) {
+                    registration.clear();
+                    tokio::time::sleep(WS_STUN_MAPPING_RETRY_INTERVAL).await;
+                    continue;
+                }
+
+                let collector = global_ctx.get_stun_info_collector();
+                let lease = collector
+                    .start_tcp_port_mapping_lease(local_port, WS_STUN_MAPPING_KEEPALIVE_INTERVAL)
+                    .await;
+                let mut lease = match lease {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        registration.clear();
+                        tracing::warn!(
+                            ?error,
+                            local_port,
+                            scheme = %scheme,
+                            "failed to start websocket STUN mapping lease"
+                        );
+                        tokio::time::sleep(WS_STUN_MAPPING_RETRY_INTERVAL).await;
+                        continue;
+                    }
+                };
+
+                registration.update(lease.current());
+                loop {
+                    let mapped_addr = match lease.changed().await {
+                        Ok(mapped_addr) => mapped_addr,
+                        Err(error) => {
+                            tracing::warn!(
+                                ?error,
+                                local_port,
+                                scheme = %scheme,
+                                "websocket STUN mapping lease ended"
+                            );
+                            break;
+                        }
+                    };
+
+                    let tcp_nat_type = NatType::try_from(
+                        global_ctx
+                            .get_stun_info_collector()
+                            .get_stun_info()
+                            .tcp_nat_type,
+                    )
+                    .unwrap_or(NatType::Unknown);
+                    if !tcp_nat_supports_public_listener(tcp_nat_type) {
+                        break;
+                    }
+                    registration.update(mapped_addr);
+                }
+
+                registration.clear();
+                tokio::time::sleep(WS_STUN_MAPPING_RETRY_INTERVAL).await;
+            }
+        });
+        Some(AbortOnDropHandle::new(task))
+    }
+}
+
 #[async_trait]
 pub trait TunnelHandlerForListener {
     async fn handle_tunnel(&self, tunnel: Box<dyn Tunnel>) -> Result<(), Error>;
-}
-
-fn ws_tcp_hole_punch_listener_info(tunnel_info: &TunnelInfo) -> Option<(String, u16)> {
-    #[cfg(feature = "websocket")]
-    {
-        if tunnel_info.tunnel_type != "tcp" {
-            return None;
-        }
-
-        let local_addr = tunnel_info.local_addr.as_ref()?;
-        let local_url = url::Url::try_from(local_addr).ok()?;
-        let scheme = local_url.query_pairs().find_map(|(key, value)| {
-            (key == crate::tunnel::websocket::WS_TCP_HOLE_PUNCH_LOCAL_QUERY)
-                .then(|| value.into_owned())
-        })?;
-        if scheme != "ws" && scheme != "wss" {
-            return None;
-        }
-
-        Some((scheme, local_url.port()?))
-    }
-
-    #[cfg(not(feature = "websocket"))]
-    {
-        let _ = tunnel_info;
-        None
-    }
-}
-
-fn is_ws_tcp_hole_punch_tunnel(tunnel: &dyn Tunnel) -> bool {
-    tunnel
-        .info()
-        .as_ref()
-        .and_then(ws_tcp_hole_punch_listener_info)
-        .is_some()
-}
-
-async fn advertise_ws_tcp_hole_punch_listener(global_ctx: ArcGlobalCtx, tunnel_info: &TunnelInfo) {
-    let Some((scheme, local_port)) = ws_tcp_hole_punch_listener_info(tunnel_info) else {
-        return;
-    };
-
-    let mapped_addr = match global_ctx
-        .get_stun_info_collector()
-        .get_tcp_port_mapping_and_hold(local_port, Duration::from_secs(90))
-        .await
-    {
-        Ok(mapped_addr) => mapped_addr,
-        Err(error) => {
-            tracing::warn!(
-                ?error,
-                local_port,
-                scheme = %scheme,
-                "ws_hole_punch: tcp hole-punch tunnel established but mapped listener update failed"
-            );
-            return;
-        }
-    };
-
-    let mapped_url = tunnel::build_url_from_socket_addr(&mapped_addr.to_string(), &scheme);
-    tracing::info!(
-        local_port,
-        ?mapped_addr,
-        mapped_url = %mapped_url,
-        scheme = %scheme,
-        "ws_hole_punch: tcp hole-punch tunnel established, advertise websocket mapped listener"
-    );
-    let generation =
-        global_ctx.add_dynamic_mapped_listener_for_port(&scheme, local_port, mapped_url.clone());
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        tracing::info!(
-            local_port,
-            mapped_url = %mapped_url,
-            scheme = %scheme,
-            "ws_hole_punch: expire websocket mapped listener from tcp hole-punch tunnel"
-        );
-        global_ctx.remove_dynamic_mapped_listener_for_port_if_generation(
-            &scheme,
-            local_port,
-            &mapped_url,
-            generation,
-        );
-    });
 }
 
 #[async_trait]
 impl TunnelHandlerForListener for PeerManager {
     #[tracing::instrument]
     async fn handle_tunnel(&self, tunnel: Box<dyn Tunnel>) -> Result<(), Error> {
-        let is_directly_connected = !is_ws_tcp_hole_punch_tunnel(tunnel.as_ref());
-        self.add_tunnel_as_server(tunnel, is_directly_connected)
-            .await
-            .map(|_| ())
+        self.add_tunnel_as_server(tunnel, true).await.map(|_| ())
     }
 }
 
@@ -291,11 +382,12 @@ impl<H: TunnelHandlerForListener + Send + Sync + 'static + Debug> ListenerManage
         loop {
             let mut l = (creator)();
             let _g = global_ctx.net_ns.guard();
-            match l.listen().await {
+            let _mapping_lease = match l.listen().await {
                 Ok(_) => {
                     err_count = 0;
                     global_ctx.add_running_listener(l.local_url());
                     global_ctx.issue_event(GlobalCtxEvent::ListenerAdded(l.local_url()));
+                    spawn_ws_stun_mapping_lease(global_ctx.clone(), l.local_url())
                 }
                 Err(e) => {
                     tracing::error!(?e, ?l, "listener listen error");
@@ -310,7 +402,7 @@ impl<H: TunnelHandlerForListener + Send + Sync + 'static + Debug> ListenerManage
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     continue;
                 }
-            }
+            };
             loop {
                 let ret = match l.accept().await {
                     Ok(ret) => ret,
@@ -347,10 +439,6 @@ impl<H: TunnelHandlerForListener + Send + Sync + 'static + Debug> ListenerManage
                         return;
                     };
                     let server_ret = peer_manager.handle_tunnel(ret).await;
-                    if server_ret.is_ok() {
-                        advertise_ws_tcp_hole_punch_listener(global_ctx.clone(), &tunnel_info)
-                            .await;
-                    }
                     if let Err(e) = &server_ret {
                         global_ctx.issue_event(GlobalCtxEvent::ConnectionError(
                             tunnel_info.local_addr.unwrap_or_default().to_string(),
@@ -399,6 +487,58 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn tcp_nat_public_listener_eligibility_is_conservative() {
+        for nat_type in [NatType::OpenInternet, NatType::NoPat, NatType::FullCone] {
+            assert!(tcp_nat_supports_public_listener(nat_type));
+        }
+
+        for nat_type in [
+            NatType::Unknown,
+            NatType::Restricted,
+            NatType::PortRestricted,
+            NatType::Symmetric,
+            NatType::SymmetricEasyInc,
+            NatType::SymmetricEasyDec,
+        ] {
+            assert!(!tcp_nat_supports_public_listener(nat_type));
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_mapped_listener_registration_updates_and_withdraws() {
+        let global_ctx = get_mock_global_ctx();
+        let mapped_addr: SocketAddr = "203.0.113.1:11011".parse().unwrap();
+        let mapped_url = tunnel::build_url_from_socket_addr(&mapped_addr.to_string(), "ws");
+        let mut registration =
+            DynamicMappedListenerRegistration::new(global_ctx.clone(), "ws".to_string(), 11011);
+
+        registration.update(Some(mapped_addr));
+        assert_eq!(
+            global_ctx.get_dynamic_mapped_listener_for_port("ws", 11011),
+            Some(mapped_url.clone())
+        );
+        assert_eq!(
+            global_ctx.get_dynamic_mapped_listeners(),
+            vec![mapped_url.clone()]
+        );
+
+        registration.update(None);
+        assert_eq!(
+            global_ctx.get_dynamic_mapped_listener_for_port("ws", 11011),
+            None
+        );
+        assert!(global_ctx.get_dynamic_mapped_listeners().is_empty());
+
+        registration.update(Some(mapped_addr));
+        drop(registration);
+        assert_eq!(
+            global_ctx.get_dynamic_mapped_listener_for_port("ws", 11011),
+            None
+        );
+        assert!(global_ctx.get_dynamic_mapped_listeners().is_empty());
+    }
 
     #[derive(Debug)]
     struct MockListenerHandler {}

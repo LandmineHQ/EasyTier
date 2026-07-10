@@ -25,8 +25,6 @@ use tokio_util::either::Either;
 use tokio_websockets::{ClientBuilder, Limits, MaybeTlsStream, Message, ServerBuilder};
 use zerocopy::AsBytes;
 
-pub(crate) const WS_TCP_HOLE_PUNCH_LOCAL_QUERY: &str = "easytier_ws_tcp_hole_punch";
-
 fn is_wss(addr: &url::Url) -> Result<bool, TunnelError> {
     match addr.scheme() {
         "ws" => Ok(false),
@@ -259,148 +257,6 @@ impl WsTunnelListener {
             Some(info),
         )))
     }
-
-    async fn accept_ws_or_pre_punch(
-        &self,
-        stream: TcpStream,
-    ) -> Result<Option<Box<dyn Tunnel>>, TunnelError> {
-        let peer_addr = stream.peer_addr().ok();
-        let local_addr = stream.local_addr().ok();
-        let mut peek = [0u8; 4];
-        let n = match timeout(Duration::from_secs(1), stream.peek(&mut peek)).await {
-            Ok(Ok(0)) => {
-                tracing::info!(
-                    listener = %self.addr,
-                    ?local_addr,
-                    ?peer_addr,
-                    "ws_hole_punch: websocket listener accepted empty tcp pre-punch"
-                );
-                return Ok(None);
-            }
-            Ok(Ok(n)) => n,
-            Ok(Err(error)) => {
-                tracing::debug!(
-                    ?error,
-                    listener = %self.addr,
-                    ?local_addr,
-                    ?peer_addr,
-                    "ws_hole_punch: websocket listener peek failed"
-                );
-                return Err(error.into());
-            }
-            Err(_) => {
-                tracing::info!(
-                    listener = %self.addr,
-                    ?local_addr,
-                    ?peer_addr,
-                    "ws_hole_punch: websocket listener accepted idle tcp pre-punch"
-                );
-                return Ok(None);
-            }
-        };
-
-        let peek = &peek[..n];
-        if is_wss(&self.addr)? {
-            let tls_client_hello = is_tls_client_hello(peek);
-            tracing::debug!(
-                listener = %self.addr,
-                ?local_addr,
-                ?peer_addr,
-                ?peek,
-                tls_client_hello,
-                "ws_hole_punch: websocket listener peeked wss bytes"
-            );
-            if tls_client_hello {
-                return self.try_accept(stream).await.map(Some);
-            }
-
-            if b"GET ".starts_with(peek) {
-                return Err(TunnelError::InvalidProtocol(
-                    "HTTP upgrade on WSS port".to_string(),
-                ));
-            }
-
-            tracing::info!(
-                listener = %self.addr,
-                ?local_addr,
-                ?peer_addr,
-                ?peek,
-                "ws_hole_punch: websocket listener accepts original tcp hole-punch stream on wss port"
-            );
-            return self.try_accept_tcp_hole_punch(stream).map(Some);
-        }
-
-        let http_upgrade = b"GET ".starts_with(peek);
-        tracing::debug!(
-            listener = %self.addr,
-            ?local_addr,
-            ?peer_addr,
-            ?peek,
-            http_upgrade,
-            "ws_hole_punch: websocket listener peeked ws bytes"
-        );
-        if http_upgrade {
-            return self.try_accept(stream).await.map(Some);
-        }
-
-        if is_tls_client_hello(peek) {
-            return Err(TunnelError::InvalidProtocol(
-                "TLS ClientHello on WS port".to_string(),
-            ));
-        }
-
-        tracing::info!(
-            listener = %self.addr,
-            ?local_addr,
-            ?peer_addr,
-            ?peek,
-            "ws_hole_punch: websocket listener accepts original tcp hole-punch stream on ws port"
-        );
-        self.try_accept_tcp_hole_punch(stream).map(Some)
-    }
-
-    fn try_accept_tcp_hole_punch(&self, stream: TcpStream) -> Result<Box<dyn Tunnel>, TunnelError> {
-        let peer_addr = stream.peer_addr()?;
-        let local_addr = stream.local_addr()?;
-        let remote_url = super::build_url_from_socket_addr(&peer_addr.to_string(), "tcp");
-        let mut local_url = super::build_url_from_socket_addr(&local_addr.to_string(), "tcp");
-        local_url
-            .query_pairs_mut()
-            .append_pair(WS_TCP_HOLE_PUNCH_LOCAL_QUERY, self.addr.scheme());
-        tracing::info!(
-            listener = %self.addr,
-            ?local_addr,
-            ?peer_addr,
-            local_url = %local_url,
-            "ws_hole_punch: websocket listener passes original tcp hole-punch stream to tcp tunnel"
-        );
-        super::tcp::get_tunnel_with_tcp_stream_and_local_url(stream, remote_url, local_url)
-    }
-}
-
-fn is_tls_client_hello(peek: &[u8]) -> bool {
-    peek.first()
-        .is_some_and(|content_type| *content_type == 0x16)
-        && peek
-            .get(1)
-            .is_none_or(|version_major| *version_major == 0x03)
-}
-
-fn is_tcp_pre_punch_error(error: &TunnelError) -> bool {
-    match error {
-        TunnelError::IOError(error) => matches!(
-            error.kind(),
-            std::io::ErrorKind::ConnectionAborted
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::UnexpectedEof
-                | std::io::ErrorKind::TimedOut
-                | std::io::ErrorKind::NotConnected
-        ),
-        TunnelError::Timeout(_) => true,
-        #[cfg(feature = "websocket")]
-        TunnelError::WebSocketError(_) => true,
-        _ => false,
-    }
 }
 
 #[async_trait::async_trait]
@@ -449,25 +305,8 @@ impl TunnelListener for WsTunnelListener {
                 "ws_hole_punch: websocket listener accepted raw tcp socket"
             );
             stream.set_nodelay(true).unwrap();
-            match timeout(Duration::from_secs(3), self.accept_ws_or_pre_punch(stream)).await {
-                Ok(Ok(Some(tunnel))) => return Ok(tunnel),
-                Ok(Ok(None)) => {
-                    tracing::info!(
-                        ?self,
-                        ?local_addr,
-                        ?peer_addr,
-                        "ws_hole_punch: ignored tcp pre-punch connection on ws/wss listener"
-                    );
-                }
-                Ok(Err(error)) if is_tcp_pre_punch_error(&error) => {
-                    tracing::info!(
-                        ?error,
-                        ?self,
-                        ?local_addr,
-                        ?peer_addr,
-                        "ws_hole_punch: ignored tcp pre-punch connection on ws/wss listener"
-                    );
-                }
+            match timeout(Duration::from_secs(3), self.try_accept(stream)).await {
+                Ok(Ok(tunnel)) => return Ok(tunnel),
                 Ok(Err(error)) => {
                     tracing::warn!(
                         ?error,
@@ -478,12 +317,12 @@ impl TunnelListener for WsTunnelListener {
                     );
                 }
                 Err(error) => {
-                    tracing::info!(
+                    tracing::warn!(
                         ?error,
                         ?self,
                         ?local_addr,
                         ?peer_addr,
-                        "ws_hole_punch: ignored timed out tcp pre-punch connection on ws/wss listener"
+                        "ws_hole_punch: websocket listener upgrade timed out"
                     );
                 }
             }

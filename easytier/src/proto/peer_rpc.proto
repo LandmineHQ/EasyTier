@@ -273,18 +273,30 @@ service UdpHolePunchRpc {
       returns (SendPunchPacketBothEasySymResponse);
 }
 
-message TcpHolePunchRequest {
-  common.SocketAddr connector_mapped_addr = 1;
-  string tunnel_scheme = 2;
-}
+message TcpHolePunchRequest { common.SocketAddr connector_mapped_addr = 1; }
 
-message TcpHolePunchResponse {
-  common.SocketAddr listener_mapped_addr = 1;
-  string tunnel_scheme = 2;
-}
+message TcpHolePunchResponse { common.SocketAddr listener_mapped_addr = 1; }
 
 service TcpHolePunchRpc {
   rpc ExchangeMappedAddr(TcpHolePunchRequest) returns (TcpHolePunchResponse);
+}
+
+enum WsHolePunchTransport {
+  WS = 0;
+  WSS = 1;
+}
+
+message WsHolePunchRequest {
+  common.SocketAddr connector_mapped_addr = 1;
+  WsHolePunchTransport transport = 2;
+}
+
+message WsHolePunchResponse {
+  common.SocketAddr listener_mapped_addr = 1;
+}
+
+service WsHolePunchRpc {
+  rpc ExchangeMappedAddr(WsHolePunchRequest) returns (WsHolePunchResponse);
 }
 
 message DirectConnectedPeerInfo { int32 latency_ms = 1; }

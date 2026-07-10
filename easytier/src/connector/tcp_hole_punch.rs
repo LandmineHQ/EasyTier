@@ -10,9 +10,7 @@ use rand::Rng as _;
 use tokio::task::JoinSet;
 
 use crate::{
-    common::{
-        PeerId, global_ctx::ArcGlobalCtx, join_joinset_background, stun::StunInfoCollectorTrait,
-    },
+    common::{PeerId, join_joinset_background, stun::StunInfoCollectorTrait},
     connector::udp_hole_punch::BackOff,
     peers::{
         peer_manager::PeerManager,
@@ -22,7 +20,9 @@ use crate::{
         common::NatType,
         peer_rpc::{
             TcpHolePunchRequest, TcpHolePunchResponse, TcpHolePunchRpc,
-            TcpHolePunchRpcClientFactory, TcpHolePunchRpcServer,
+            TcpHolePunchRpcClientFactory, TcpHolePunchRpcServer, WsHolePunchRequest,
+            WsHolePunchResponse, WsHolePunchRpc, WsHolePunchRpcClientFactory, WsHolePunchRpcServer,
+            WsHolePunchTransport,
         },
         rpc_types::{self, controller::BaseController},
     },
@@ -33,10 +33,7 @@ use crate::tunnel::common::bind;
 use tokio::net::{TcpSocket, TcpStream};
 
 #[cfg(feature = "websocket")]
-use crate::tunnel::websocket::{WS_TCP_HOLE_PUNCH_LOCAL_QUERY, upgrade_tcp_to_websocket_tunnel};
-
-#[cfg(feature = "websocket")]
-use crate::tunnel::tcp::get_tunnel_with_tcp_stream_and_local_url;
+use crate::tunnel::websocket::upgrade_tcp_to_websocket_tunnel;
 
 use crate::connector::{should_background_p2p_with_peer, should_try_p2p_with_peer};
 
@@ -56,10 +53,6 @@ fn handle_rpc_result<T>(
             Err(e)
         }
     }
-}
-
-fn is_invalid_service_key_error(error: &rpc_types::error::Error) -> bool {
-    matches!(error, rpc_types::error::Error::InvalidServiceKey(_, _))
 }
 
 fn is_symmetric_tcp_nat(nat_type: NatType) -> bool {
@@ -103,20 +96,23 @@ impl TcpHolePunchTunnel {
         }
     }
 
-    fn from_scheme(scheme: &str) -> Result<Self, Error> {
-        match scheme {
-            "" | "tcp" => Ok(Self::Tcp),
-            "ws" => Ok(Self::Ws),
-            "wss" => Ok(Self::Wss),
-            _ => Err(anyhow::anyhow!(
-                "unsupported tcp hole punch tunnel scheme: {}",
-                scheme
-            )),
+    fn is_websocket(self) -> bool {
+        matches!(self, Self::Ws | Self::Wss)
+    }
+
+    fn ws_transport(self) -> Result<WsHolePunchTransport, Error> {
+        match self {
+            Self::Ws => Ok(WsHolePunchTransport::Ws),
+            Self::Wss => Ok(WsHolePunchTransport::Wss),
+            Self::Tcp => Err(anyhow::anyhow!("tcp is not a websocket transport")),
         }
     }
 
-    fn is_websocket(self) -> bool {
-        matches!(self, Self::Ws | Self::Wss)
+    fn from_ws_transport(transport: WsHolePunchTransport) -> Self {
+        match transport {
+            WsHolePunchTransport::Ws => Self::Ws,
+            WsHolePunchTransport::Wss => Self::Wss,
+        }
     }
 }
 
@@ -160,7 +156,10 @@ fn tcp_hole_punch_transport_enabled(
     tunnel: TcpHolePunchTunnel,
 ) -> bool {
     match tunnel {
-        TcpHolePunchTunnel::Tcp => true,
+        TcpHolePunchTunnel::Tcp => {
+            listener_has_scheme(peer_mgr, "tcp")
+                || (!listener_has_scheme(peer_mgr, "ws") && !listener_has_scheme(peer_mgr, "wss"))
+        }
         TcpHolePunchTunnel::Ws | TcpHolePunchTunnel::Wss => {
             #[cfg(feature = "websocket")]
             {
@@ -218,10 +217,6 @@ async fn build_punched_tcp_tunnel(
             }
         }
     }
-}
-
-fn mapped_listener_url(tunnel: TcpHolePunchTunnel, mapped_addr: SocketAddr) -> url::Url {
-    crate::tunnel::build_url_from_socket_addr(&mapped_addr.to_string(), tunnel.scheme())
 }
 
 fn socket_addr_from_url(url: &url::Url) -> Option<SocketAddr> {
@@ -334,150 +329,64 @@ async fn get_tcp_port_mapping_for_tunnel(
     ret.with_context(|| "failed to get tcp port mapping")
 }
 
-fn advertise_dynamic_mapped_listener(
-    global_ctx: ArcGlobalCtx,
-    tunnel: TcpHolePunchTunnel,
-    local_port: u16,
-    url: url::Url,
-    ttl: Duration,
-) {
-    tracing::info!(
-        mapped_url = %url,
-        local_port,
-        tunnel = tunnel.scheme(),
-        ttl_secs = ttl.as_secs(),
-        "ws_hole_punch: advertise dynamic mapped listener"
-    );
-    let generation =
-        global_ctx.add_dynamic_mapped_listener_for_port(tunnel.scheme(), local_port, url.clone());
-    tokio::spawn(async move {
-        tokio::time::sleep(ttl).await;
-        tracing::info!(
-            mapped_url = %url,
-            local_port,
-            tunnel = tunnel.scheme(),
-            "ws_hole_punch: expire dynamic mapped listener"
-        );
-        global_ctx.remove_dynamic_mapped_listener_for_port_if_generation(
-            tunnel.scheme(),
-            local_port,
-            &url,
-            generation,
-        );
-    });
-}
-
-async fn build_hole_punch_tunnel(
-    stream: TcpStream,
-    tunnel: TcpHolePunchTunnel,
-    is_server: bool,
-    remote_addr: SocketAddr,
-    legacy_websocket_tunnel: Option<TcpHolePunchTunnel>,
-) -> Result<Box<dyn Tunnel>, Error> {
-    if let Some(websocket_tunnel) = legacy_websocket_tunnel {
-        if tunnel != TcpHolePunchTunnel::Tcp || !websocket_tunnel.is_websocket() {
-            return Err(anyhow::anyhow!(
-                "invalid legacy websocket tcp hole punch marker: tunnel={}, marker={}",
-                tunnel.scheme(),
-                websocket_tunnel.scheme()
-            ));
-        }
-
-        #[cfg(feature = "websocket")]
-        {
-            let remote_url =
-                crate::tunnel::build_url_from_socket_addr(&remote_addr.to_string(), "tcp");
-            let mut local_url =
-                crate::tunnel::build_url_from_socket_addr(&stream.local_addr()?.to_string(), "tcp");
-            local_url
-                .query_pairs_mut()
-                .append_pair(WS_TCP_HOLE_PUNCH_LOCAL_QUERY, websocket_tunnel.scheme());
-            tracing::info!(
-                ?remote_addr,
-                local_url = %local_url,
-                websocket_tunnel = websocket_tunnel.scheme(),
-                "ws_hole_punch: mark legacy tcp hole-punch tunnel for later websocket replacement"
-            );
-            return get_tunnel_with_tcp_stream_and_local_url(stream, remote_url, local_url)
-                .map_err(Into::into);
-        }
-
-        #[cfg(not(feature = "websocket"))]
-        {
-            let _ = websocket_tunnel;
-            return Err(anyhow::anyhow!(
-                "legacy websocket tcp hole punch marker requires websocket feature"
-            ));
-        }
-    }
-
-    build_punched_tcp_tunnel(stream, tunnel, is_server, remote_addr).await
-}
-
 async fn exchange_tcp_hole_punch_mapped_addr(
     peer_mgr: Arc<PeerManager>,
     dst_peer_id: PeerId,
     domain_name: String,
     mapped_addr: SocketAddr,
-    tunnel: TcpHolePunchTunnel,
 ) -> Result<TcpHolePunchResponse, rpc_types::error::Error> {
-    let mut attempts = vec![domain_name];
-    if !attempts[0].is_empty() {
-        attempts.push(String::new());
-    }
+    let rpc_stub = peer_mgr
+        .get_peer_rpc_mgr()
+        .rpc_client()
+        .scoped_client::<TcpHolePunchRpcClientFactory<BaseController>>(
+            peer_mgr.my_peer_id(),
+            dst_peer_id,
+            domain_name,
+        );
 
-    for (attempt_idx, domain_name) in attempts.into_iter().enumerate() {
-        let rpc_stub = peer_mgr
-            .get_peer_rpc_mgr()
-            .rpc_client()
-            .scoped_client::<TcpHolePunchRpcClientFactory<BaseController>>(
-                peer_mgr.my_peer_id(),
-                dst_peer_id,
-                domain_name.clone(),
-            );
+    rpc_stub
+        .exchange_mapped_addr(
+            BaseController {
+                timeout_ms: 6000,
+                ..Default::default()
+            },
+            TcpHolePunchRequest {
+                connector_mapped_addr: Some(mapped_addr.into()),
+            },
+        )
+        .await
+}
 
-        let resp = rpc_stub
-            .exchange_mapped_addr(
-                BaseController {
-                    timeout_ms: 6000,
-                    ..Default::default()
-                },
-                TcpHolePunchRequest {
-                    connector_mapped_addr: Some(mapped_addr.into()),
-                    tunnel_scheme: tunnel.scheme().to_string(),
-                },
-            )
-            .await;
+async fn exchange_ws_hole_punch_mapped_addr(
+    peer_mgr: Arc<PeerManager>,
+    dst_peer_id: PeerId,
+    domain_name: String,
+    mapped_addr: SocketAddr,
+    tunnel: TcpHolePunchTunnel,
+) -> Result<WsHolePunchResponse, rpc_types::error::Error> {
+    let rpc_stub = peer_mgr
+        .get_peer_rpc_mgr()
+        .rpc_client()
+        .scoped_client::<WsHolePunchRpcClientFactory<BaseController>>(
+            peer_mgr.my_peer_id(),
+            dst_peer_id,
+            domain_name,
+        );
 
-        match resp {
-            Ok(resp) => {
-                if attempt_idx > 0 {
-                    tracing::info!(
-                        dst_peer_id,
-                        tunnel = tunnel.scheme(),
-                        "ws_hole_punch: TcpHolePunchRpc legacy domain retry succeeded"
-                    );
-                }
-                return Ok(resp);
-            }
-            Err(error)
-                if attempt_idx == 0
-                    && !domain_name.is_empty()
-                    && is_invalid_service_key_error(&error) =>
-            {
-                tracing::warn!(
-                    dst_peer_id,
-                    tunnel = tunnel.scheme(),
-                    domain_name = %domain_name,
-                    "ws_hole_punch: TcpHolePunchRpc missing on primary domain, retry legacy empty domain"
-                );
-                continue;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-
-    unreachable!("tcp hole punch rpc domain attempts should always have at least one entry")
+    rpc_stub
+        .exchange_mapped_addr(
+            BaseController {
+                timeout_ms: 6000,
+                ..Default::default()
+            },
+            WsHolePunchRequest {
+                connector_mapped_addr: Some(mapped_addr.into()),
+                transport: tunnel
+                    .ws_transport()
+                    .map_err(rpc_types::error::Error::from)? as i32,
+            },
+        )
+        .await
 }
 
 async fn try_connect_to_remote(
@@ -487,17 +396,12 @@ async fn try_connect_to_remote(
     tunnel: TcpHolePunchTunnel,
     is_client: bool,
     max_attempts: u32,
-    legacy_websocket_tunnel: Option<TcpHolePunchTunnel>,
 ) -> Result<(), Error> {
     let tunnel_scheme = tunnel.scheme();
-    let legacy_websocket_tunnel_scheme = legacy_websocket_tunnel
-        .map(|tunnel| tunnel.scheme())
-        .unwrap_or("");
     tracing::info!(
         ?a_mapped_addr,
         local_port,
         tunnel = tunnel_scheme,
-        legacy_websocket_tunnel = legacy_websocket_tunnel_scheme,
         "tcp hole punch start connect loop"
     );
 
@@ -535,18 +439,11 @@ async fn try_connect_to_remote(
                 local_port,
                 attempts,
                 tunnel = tunnel_scheme,
-                legacy_websocket_tunnel = legacy_websocket_tunnel_scheme,
                 "tcp hole punch connected, build tunnel"
             );
             let tunnel = match tokio::time::timeout(
                 Duration::from_secs(3),
-                build_hole_punch_tunnel(
-                    stream,
-                    tunnel,
-                    is_server,
-                    a_mapped_addr,
-                    legacy_websocket_tunnel,
-                ),
+                build_punched_tcp_tunnel(stream, tunnel, is_server, a_mapped_addr),
             )
             .await
             {
@@ -557,7 +454,6 @@ async fn try_connect_to_remote(
                         local_port,
                         attempts,
                         tunnel = tunnel_scheme,
-                        legacy_websocket_tunnel = legacy_websocket_tunnel_scheme,
                         ?e,
                         "tcp hole punch connected but tunnel upgrade failed"
                     );
@@ -569,7 +465,6 @@ async fn try_connect_to_remote(
                         local_port,
                         attempts,
                         tunnel = tunnel_scheme,
-                        legacy_websocket_tunnel = legacy_websocket_tunnel_scheme,
                         "tcp hole punch connected but tunnel upgrade timed out"
                     );
                     continue;
@@ -607,7 +502,6 @@ async fn try_connect_to_remote(
                 is_client,
                 is_directly_connected,
                 tunnel = tunnel_scheme,
-                legacy_websocket_tunnel = legacy_websocket_tunnel_scheme,
                 "tcp hole punch connected and added tunnel"
             );
             return Ok(());
@@ -638,6 +532,89 @@ impl TcpHolePunchServer {
         join_joinset_background(tasks.clone(), "tcp hole punch server".to_string());
         Arc::new(Self { peer_mgr, tasks })
     }
+
+    async fn prepare_hole_punch(
+        &self,
+        connector_mapped_addr: Option<crate::proto::common::SocketAddr>,
+        tunnel: TcpHolePunchTunnel,
+    ) -> rpc_types::error::Result<SocketAddr> {
+        let my_tcp_nat_type = NatType::try_from(
+            self.peer_mgr
+                .get_global_ctx()
+                .get_stun_info_collector()
+                .get_stun_info()
+                .tcp_nat_type,
+        )
+        .unwrap_or(NatType::Unknown);
+
+        let remote_mapped_addr =
+            connector_mapped_addr.ok_or(anyhow::anyhow!("connector_mapped_addr is required"))?;
+        let remote_mapped_addr: SocketAddr = remote_mapped_addr.into();
+        let remote_ip = remote_mapped_addr.ip();
+        if remote_ip.is_unspecified() || remote_ip.is_multicast() {
+            tracing::warn!(
+                ?remote_mapped_addr,
+                "tcp hole punch rpc invalid connector addr"
+            );
+            return Err(anyhow::anyhow!("connector_mapped_addr is malformed").into());
+        }
+
+        if should_skip_tcp_hole_punch_for_nat(my_tcp_nat_type, tunnel, false) {
+            return Err(anyhow::anyhow!(
+                "tcp nat type not supported for {} hole punch: {:?}",
+                tunnel.scheme(),
+                my_tcp_nat_type
+            )
+            .into());
+        }
+        if !tcp_hole_punch_transport_enabled(&self.peer_mgr, tunnel) {
+            return Err(anyhow::anyhow!(
+                "tcp hole punch transport is not enabled: {}",
+                tunnel.scheme()
+            )
+            .into());
+        }
+
+        let is_v6 = remote_mapped_addr.is_ipv6();
+        let local_bind_addr = match tunnel {
+            TcpHolePunchTunnel::Tcp => {
+                bind_addr_for_port(select_local_port(&self.peer_mgr, is_v6).await?, is_v6)
+            }
+            TcpHolePunchTunnel::Ws | TcpHolePunchTunnel::Wss => {
+                running_listener_bind_addr_for_tunnel(&self.peer_mgr, tunnel, is_v6).await?
+            }
+        };
+        let local_port = local_bind_addr.port();
+        let mapped_addr =
+            get_tcp_port_mapping_for_tunnel(&self.peer_mgr, tunnel, local_port).await?;
+
+        tracing::info!(
+            ?remote_mapped_addr,
+            ?mapped_addr,
+            ?local_bind_addr,
+            ?my_tcp_nat_type,
+            tunnel = tunnel.scheme(),
+            "tcp hole punch rpc responding with mapped addr and starting connect"
+        );
+
+        let peer_mgr = self.peer_mgr.clone();
+        self.tasks.lock().unwrap().spawn(async move {
+            if let Err(error) =
+                try_connect_to_remote(peer_mgr, remote_mapped_addr, local_port, tunnel, true, 5)
+                    .await
+            {
+                tracing::warn!(
+                    ?error,
+                    ?remote_mapped_addr,
+                    local_port,
+                    tunnel = tunnel.scheme(),
+                    "tcp hole punch responder connect failed"
+                );
+            }
+        });
+
+        Ok(mapped_addr)
+    }
 }
 
 #[async_trait::async_trait]
@@ -650,233 +627,33 @@ impl TcpHolePunchRpc for TcpHolePunchServer {
         _ctrl: Self::Controller,
         input: TcpHolePunchRequest,
     ) -> rpc_types::error::Result<TcpHolePunchResponse> {
-        let my_tcp_nat_type = NatType::try_from(
-            self.peer_mgr
-                .get_global_ctx()
-                .get_stun_info_collector()
-                .get_stun_info()
-                .tcp_nat_type,
-        )
-        .unwrap_or(NatType::Unknown);
-        tracing::debug!(
-            ?my_tcp_nat_type,
-            "ws_hole_punch: tcp hole punch rpc received"
-        );
-
-        let a_mapped_addr = input
-            .connector_mapped_addr
-            .ok_or(anyhow::anyhow!("connector_mapped_addr is required"))?;
-        let a_mapped_addr: SocketAddr = a_mapped_addr.into();
-        let a_ip = a_mapped_addr.ip();
-        if a_ip.is_unspecified() || a_ip.is_multicast() {
-            tracing::warn!(?a_mapped_addr, "tcp hole punch rpc invalid connector addr");
-            return Err(anyhow::anyhow!("connector_mapped_addr is malformed").into());
-        }
-
-        let is_legacy_request = input.tunnel_scheme.is_empty();
-        let tunnel = if is_legacy_request {
-            select_tcp_hole_punch_transport(&self.peer_mgr)
-        } else {
-            TcpHolePunchTunnel::from_scheme(&input.tunnel_scheme)?
-        };
-        tracing::info!(
-            ?a_mapped_addr,
-            requested_tunnel_scheme = %input.tunnel_scheme,
-            selected_tunnel = tunnel.scheme(),
-            is_legacy_request,
-            ?my_tcp_nat_type,
-            "ws_hole_punch: rpc exchange selected tunnel"
-        );
-        if should_skip_tcp_hole_punch_for_nat(my_tcp_nat_type, tunnel, false) {
-            tracing::warn!(
-                ?my_tcp_nat_type,
-                tunnel = tunnel.scheme(),
-                "ws_hole_punch: tcp hole punch rpc rejected by local tcp nat type"
-            );
-            return Err(anyhow::anyhow!(
-                "tcp nat type not supported for {} hole punch: {:?}",
-                tunnel.scheme(),
-                my_tcp_nat_type
-            )
-            .into());
-        }
-        if !tcp_hole_punch_transport_enabled(&self.peer_mgr, tunnel) {
-            tracing::warn!(
-                ?tunnel,
-                tunnel_scheme = input.tunnel_scheme,
-                "ws_hole_punch: tcp hole punch rpc rejected (tunnel scheme not enabled)"
-            );
-            return Err(anyhow::anyhow!(
-                "tcp hole punch tunnel scheme not enabled: {}",
-                input.tunnel_scheme
-            )
-            .into());
-        }
-
-        let is_v6 = a_mapped_addr.is_ipv6();
-        let local_bind_addr = match tunnel {
-            TcpHolePunchTunnel::Tcp => {
-                bind_addr_for_port(select_local_port(&self.peer_mgr, is_v6).await?, is_v6)
-            }
-            TcpHolePunchTunnel::Ws | TcpHolePunchTunnel::Wss => {
-                running_listener_bind_addr_for_tunnel(&self.peer_mgr, tunnel, is_v6).await?
-            }
-        };
-        let local_port = local_bind_addr.port();
-        tracing::debug!(
-            ?local_bind_addr,
-            local_port,
-            tunnel = tunnel.scheme(),
-            is_v6,
-            "ws_hole_punch: rpc exchange querying tcp port mapping"
-        );
-        let mapped_addr =
-            get_tcp_port_mapping_for_tunnel(&self.peer_mgr, tunnel, local_port).await?;
-
-        tracing::info!(
-            ?a_mapped_addr,
-            local_port,
-            ?mapped_addr,
-            tunnel = tunnel.scheme(),
-            is_legacy_request,
-            "ws_hole_punch: rpc responding with listener mapped addr and start connecting"
-        );
-
-        let websocket_mapped_url = if tunnel.is_websocket() {
-            let mapped_url = mapped_listener_url(tunnel, mapped_addr);
-            tracing::info!(
-                local_port,
-                mapped_url = %mapped_url,
-                tunnel = tunnel.scheme(),
-                "ws_hole_punch: prepared websocket listener mapped address; advertise after tcp pre-punch succeeds"
-            );
-            Some(mapped_url)
-        } else {
-            None
-        };
-
-        let peer_mgr = self.peer_mgr.clone();
-        self.tasks.lock().unwrap().spawn(async move {
-            match tunnel {
-                TcpHolePunchTunnel::Tcp => {
-                    let _ = try_connect_to_remote(
-                        peer_mgr,
-                        a_mapped_addr,
-                        local_port,
-                        tunnel,
-                        true,
-                        5,
-                        None,
-                    )
-                    .await;
-                }
-                TcpHolePunchTunnel::Ws | TcpHolePunchTunnel::Wss => {
-                    #[cfg(feature = "websocket")]
-                    {
-                        tracing::info!(
-                            ?a_mapped_addr,
-                            ?mapped_addr,
-                            ?local_bind_addr,
-                            local_port,
-                            tunnel = tunnel.scheme(),
-                            "ws_hole_punch: responder pre-punch task start"
-                        );
-                        let punch_ret = if is_legacy_request {
-                            tracing::info!(
-                                ?a_mapped_addr,
-                                local_port,
-                                websocket_tunnel = tunnel.scheme(),
-                                "ws_hole_punch: legacy peer uses original tcp hole punch tunnel"
-                            );
-                            try_connect_to_remote(
-                                peer_mgr.clone(),
-                                a_mapped_addr,
-                                local_port,
-                                TcpHolePunchTunnel::Tcp,
-                                true,
-                                5,
-                                Some(tunnel),
-                            )
-                            .await
-                        } else {
-                            tracing::info!(
-                                ?a_mapped_addr,
-                                local_port,
-                                websocket_tunnel = tunnel.scheme(),
-                                "ws_hole_punch: HEAD peer upgrades tcp pre-punch stream directly"
-                            );
-                            try_connect_to_remote(
-                                peer_mgr.clone(),
-                                a_mapped_addr,
-                                local_port,
-                                tunnel,
-                                true,
-                                5,
-                                None,
-                            )
-                            .await
-                        };
-
-                        match punch_ret {
-                            Ok(()) => {
-                                if is_legacy_request
-                                    && let Some(mapped_url) = websocket_mapped_url.as_ref()
-                                {
-                                    advertise_dynamic_mapped_listener(
-                                        peer_mgr.get_global_ctx(),
-                                        tunnel,
-                                        local_port,
-                                        mapped_url.clone(),
-                                        Duration::from_secs(60),
-                                    );
-                                    tracing::info!(
-                                        local_port,
-                                        ?mapped_addr,
-                                        mapped_url = %mapped_url,
-                                        tunnel = tunnel.scheme(),
-                                        is_legacy_request,
-                                        "ws_hole_punch: refreshed websocket listener mapped address after tcp pre-punch"
-                                    );
-                                } else {
-                                    tracing::info!(
-                                        local_port,
-                                        ?mapped_addr,
-                                        tunnel = tunnel.scheme(),
-                                        "ws_hole_punch: websocket tunnel established directly from tcp pre-punch"
-                                    );
-                                }
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    ?error,
-                                    local_port,
-                                    tunnel = tunnel.scheme(),
-                                    is_legacy_request,
-                                    "ws_hole_punch: tcp pre-punch failed; not advertising websocket mapped listener to avoid remote blacklist"
-                                );
-                            }
-                        }
-                    }
-
-                    #[cfg(not(feature = "websocket"))]
-                    {
-                        let _ = (peer_mgr, a_mapped_addr, local_port, mapped_addr);
-                        tracing::warn!(
-                            "ws_hole_punch: websocket feature required for dynamic ws/wss listener"
-                        );
-                    }
-                }
-            }
-        });
-
-        tracing::info!(
-            ?mapped_addr,
-            tunnel_scheme = tunnel.scheme(),
-            "ws_hole_punch: rpc response sent"
-        );
+        let mapped_addr = self
+            .prepare_hole_punch(input.connector_mapped_addr, TcpHolePunchTunnel::Tcp)
+            .await?;
         Ok(TcpHolePunchResponse {
             listener_mapped_addr: Some(mapped_addr.into()),
-            tunnel_scheme: tunnel.scheme().to_string(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl WsHolePunchRpc for TcpHolePunchServer {
+    type Controller = BaseController;
+
+    #[tracing::instrument(skip(self), fields(a_mapped_addr = ?input.connector_mapped_addr), err)]
+    async fn exchange_mapped_addr(
+        &self,
+        _ctrl: Self::Controller,
+        input: WsHolePunchRequest,
+    ) -> rpc_types::error::Result<WsHolePunchResponse> {
+        let transport = WsHolePunchTransport::try_from(input.transport)
+            .map_err(|_| anyhow::anyhow!("invalid websocket hole punch transport"))?;
+        let tunnel = TcpHolePunchTunnel::from_ws_transport(transport);
+        let mapped_addr = self
+            .prepare_hole_punch(input.connector_mapped_addr, tunnel)
+            .await?;
+        Ok(WsHolePunchResponse {
+            listener_mapped_addr: Some(mapped_addr.into()),
         })
     }
 }
@@ -995,30 +772,28 @@ impl TcpHolePunchConnectorData {
             "ws_hole_punch: initiator got mapped addr, start rpc exchange"
         );
 
-        let local_websocket_mapped_url = if tunnel.is_websocket() {
-            let mapped_url = mapped_listener_url(tunnel, mapped_addr);
-            tracing::info!(
-                local_port,
-                mapped_url = %mapped_url,
-                tunnel = tunnel.scheme(),
-                "ws_hole_punch: prepared local websocket listener mapped address; advertise after tcp pre-punch succeeds"
-            );
-            Some(mapped_url)
-        } else {
-            None
-        };
-
         let domain_name = self.peer_mgr.get_global_ctx().get_network_name();
-        let resp = match exchange_tcp_hole_punch_mapped_addr(
-            self.peer_mgr.clone(),
-            dst_peer_id,
-            domain_name,
-            mapped_addr,
-            tunnel,
-        )
-        .await
-        {
-            Ok(resp) => resp,
+        let remote_mapped_addr = match match tunnel {
+            TcpHolePunchTunnel::Tcp => exchange_tcp_hole_punch_mapped_addr(
+                self.peer_mgr.clone(),
+                dst_peer_id,
+                domain_name,
+                mapped_addr,
+            )
+            .await
+            .map(|response| response.listener_mapped_addr),
+            TcpHolePunchTunnel::Ws | TcpHolePunchTunnel::Wss => exchange_ws_hole_punch_mapped_addr(
+                self.peer_mgr.clone(),
+                dst_peer_id,
+                domain_name,
+                mapped_addr,
+                tunnel,
+            )
+            .await
+            .map(|response| response.listener_mapped_addr),
+        } {
+            Ok(Some(remote_mapped_addr)) => SocketAddr::from(remote_mapped_addr),
+            Ok(None) => return Err(anyhow::anyhow!("listener_mapped_addr is required")),
             Err(error) => {
                 tracing::debug!(
                     dst_peer_id,
@@ -1041,20 +816,10 @@ impl TcpHolePunchConnectorData {
             return Ok(());
         }
 
-        let remote_tunnel = if resp.tunnel_scheme.is_empty() {
-            TcpHolePunchTunnel::Tcp
-        } else {
-            TcpHolePunchTunnel::from_scheme(&resp.tunnel_scheme)?
-        };
-        let remote_mapped_addr = resp
-            .listener_mapped_addr
-            .ok_or(anyhow::anyhow!("listener_mapped_addr is required"))?;
-        let remote_mapped_addr: SocketAddr = remote_mapped_addr.into();
         tracing::info!(
             dst_peer_id,
             ?remote_mapped_addr,
-            remote_tunnel = remote_tunnel.scheme(),
-            response_tunnel_scheme = %resp.tunnel_scheme,
+            tunnel = tunnel.scheme(),
             "ws_hole_punch: initiator rpc returned"
         );
         if self.peer_already_directly_connected(dst_peer_id, "before_pre_punch") {
@@ -1064,81 +829,6 @@ impl TcpHolePunchConnectorData {
         if tunnel.is_websocket() {
             #[cfg(feature = "websocket")]
             {
-                if remote_tunnel != tunnel {
-                    tracing::info!(
-                        dst_peer_id,
-                        local_port,
-                        ?remote_mapped_addr,
-                        websocket_tunnel = tunnel.scheme(),
-                        remote_tunnel = remote_tunnel.scheme(),
-                        "ws_hole_punch: legacy peer uses original tcp hole punch tunnel"
-                    );
-                    let advertised_local_listener = match try_connect_to_remote(
-                        self.peer_mgr.clone(),
-                        remote_mapped_addr,
-                        local_port,
-                        TcpHolePunchTunnel::Tcp,
-                        false,
-                        5,
-                        Some(tunnel),
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            if let Some(mapped_url) = local_websocket_mapped_url.as_ref() {
-                                advertise_dynamic_mapped_listener(
-                                    global_ctx.clone(),
-                                    tunnel,
-                                    local_port,
-                                    mapped_url.clone(),
-                                    Duration::from_secs(60),
-                                );
-                                tracing::info!(
-                                    local_port,
-                                    mapped_url = %mapped_url,
-                                    tunnel = tunnel.scheme(),
-                                    "ws_hole_punch: refreshed local websocket listener mapped address after legacy tcp pre-punch"
-                                );
-                                true
-                            } else {
-                                false
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                ?error,
-                                local_port,
-                                tunnel = tunnel.scheme(),
-                                "ws_hole_punch: legacy tcp pre-punch failed; not advertising websocket mapped listener to avoid remote blacklist"
-                            );
-                            false
-                        }
-                    };
-
-                    if self.peer_already_directly_connected(dst_peer_id, "after_pre_punch") {
-                        return Ok(());
-                    }
-
-                    if advertised_local_listener {
-                        tracing::info!(
-                            dst_peer_id,
-                            local_port,
-                            remote_tunnel = remote_tunnel.scheme(),
-                            local_tunnel = tunnel.scheme(),
-                            "ws_hole_punch: remote peer does not expose websocket mapped listener; waiting for direct connector to use advertised listener"
-                        );
-                    } else {
-                        tracing::info!(
-                            dst_peer_id,
-                            local_port,
-                            remote_tunnel = remote_tunnel.scheme(),
-                            local_tunnel = tunnel.scheme(),
-                            "ws_hole_punch: remote peer does not expose websocket mapped listener; local listener not advertised because tcp pre-punch failed"
-                        );
-                    }
-                    return Ok(());
-                }
-
                 match try_connect_to_remote(
                     self.peer_mgr.clone(),
                     remote_mapped_addr,
@@ -1146,7 +836,6 @@ impl TcpHolePunchConnectorData {
                     tunnel,
                     false,
                     5,
-                    None,
                 )
                 .await
                 {
@@ -1188,7 +877,6 @@ impl TcpHolePunchConnectorData {
             tunnel,
             false,
             1,
-            None,
         )
         .await
         {
@@ -1436,19 +1124,24 @@ impl TcpHolePunchConnector {
 
     pub async fn run_as_server(&mut self) -> Result<(), Error> {
         tracing::info!("tcp hole punch server register rpc");
-        let server = TcpHolePunchRpcServer::new_arc(self.server.clone());
         let network_name = self.peer_mgr.get_global_ctx().get_network_name();
-        self.peer_mgr
-            .get_peer_rpc_mgr()
-            .rpc_server()
-            .registry()
-            .register(server.clone(), &network_name);
-        if !network_name.is_empty() {
+        if tcp_hole_punch_transport_enabled(&self.peer_mgr, TcpHolePunchTunnel::Tcp) {
+            let server = TcpHolePunchRpcServer::new_arc(self.server.clone());
             self.peer_mgr
                 .get_peer_rpc_mgr()
                 .rpc_server()
                 .registry()
-                .register(server, "");
+                .register(server, &network_name);
+        }
+        if tcp_hole_punch_transport_enabled(&self.peer_mgr, TcpHolePunchTunnel::Ws)
+            || tcp_hole_punch_transport_enabled(&self.peer_mgr, TcpHolePunchTunnel::Wss)
+        {
+            let server = WsHolePunchRpcServer::new_arc(self.server.clone());
+            self.peer_mgr
+                .get_peer_rpc_mgr()
+                .rpc_server()
+                .registry()
+                .register(server, &network_name);
         }
         Ok(())
     }

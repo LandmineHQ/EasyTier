@@ -13,8 +13,9 @@ use rand::seq::IteratorRandom;
 use socket2::SockRef;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, UdpSocket, lookup_host};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, broadcast, watch};
 use tokio::task::JoinSet;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{Instrument, Level};
 
 use bytecodec::{DecodeExt, EncodeExt};
@@ -793,11 +794,10 @@ impl TcpStunClient {
         Ok(stream)
     }
 
-    async fn bind_request_inner(
-        self,
-        reset_on_drop: bool,
-    ) -> Result<(BindRequestResponse, tokio::net::TcpStream), Error> {
-        let mut stream = self.connect(reset_on_drop).await?;
+    async fn bind_request_on_stream(
+        &self,
+        stream: &mut tokio::net::TcpStream,
+    ) -> Result<BindRequestResponse, Error> {
         let local_addr = stream.local_addr()?;
         let stun_host = self.stun_server;
 
@@ -810,7 +810,7 @@ impl TcpStunClient {
         tokio::time::timeout(self.io_timeout, stream.write_all(msg.as_slice())).await??;
 
         let now = Instant::now();
-        let msg = Self::tcp_read_stun_message(&mut stream, self.io_timeout).await?;
+        let msg = Self::tcp_read_stun_message(stream, self.io_timeout).await?;
         if msg.class() != MessageClass::SuccessResponse
             || msg.method() != BINDING
             || tid_to_u32(&msg.transaction_id()) != tid
@@ -833,6 +833,15 @@ impl TcpStunClient {
             latency_us: now.elapsed().as_micros() as u32,
         };
 
+        Ok(resp)
+    }
+
+    async fn bind_request_inner(
+        &self,
+        reset_on_drop: bool,
+    ) -> Result<(BindRequestResponse, tokio::net::TcpStream), Error> {
+        let mut stream = self.connect(reset_on_drop).await?;
+        let resp = self.bind_request_on_stream(&mut stream).await?;
         Ok((resp, stream))
     }
 
@@ -877,6 +886,33 @@ impl TcpStunClient {
         });
         Ok(resp)
     }
+}
+
+async fn open_tcp_port_mapping(
+    stun_servers: &[SocketAddr],
+    local_port: u16,
+) -> Result<(SocketAddr, SocketAddr, tokio::net::TcpStream), Error> {
+    for server in stun_servers {
+        let client = TcpStunClient::new(*server, local_port);
+        match client.bind_request_inner(false).await {
+            Ok((response, stream)) => {
+                if let Some(mapped_addr) = response.mapped_socket_addr {
+                    return Ok((*server, mapped_addr, stream));
+                }
+                tracing::warn!(?server, "tcp stun response missing mapped address");
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    ?server,
+                    local_port,
+                    "tcp stun mapping connect failed"
+                );
+            }
+        }
+    }
+
+    Err(Error::NotFound)
 }
 
 pub struct TcpNatTypeDetector {
@@ -941,6 +977,43 @@ impl TcpNatTypeDetector {
     }
 }
 
+pub struct TcpPortMappingLease {
+    mapped_addr: watch::Receiver<Option<SocketAddr>>,
+    _task: AbortOnDropHandle<()>,
+}
+
+impl TcpPortMappingLease {
+    fn fixed(mapped_addr: SocketAddr) -> Self {
+        let (sender, receiver) = watch::channel(Some(mapped_addr));
+        let task = tokio::spawn(async move {
+            sender.closed().await;
+        });
+        Self {
+            mapped_addr: receiver,
+            _task: AbortOnDropHandle::new(task),
+        }
+    }
+
+    fn new(
+        mapped_addr: watch::Receiver<Option<SocketAddr>>,
+        task: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            mapped_addr,
+            _task: AbortOnDropHandle::new(task),
+        }
+    }
+
+    pub fn current(&self) -> Option<SocketAddr> {
+        *self.mapped_addr.borrow()
+    }
+
+    pub async fn changed(&mut self) -> Result<Option<SocketAddr>, watch::error::RecvError> {
+        self.mapped_addr.changed().await?;
+        Ok(*self.mapped_addr.borrow_and_update())
+    }
+}
+
 #[async_trait::async_trait]
 #[auto_impl::auto_impl(&, Arc, Box)]
 pub trait StunInfoCollectorTrait: Send + Sync {
@@ -958,6 +1031,15 @@ pub trait StunInfoCollectorTrait: Send + Sync {
     ) -> Result<SocketAddr, Error> {
         let _ = hold_duration;
         self.get_tcp_port_mapping(local_port).await
+    }
+    async fn start_tcp_port_mapping_lease(
+        &self,
+        local_port: u16,
+        _keepalive_interval: Duration,
+    ) -> Result<TcpPortMappingLease, Error> {
+        Ok(TcpPortMappingLease::fixed(
+            self.get_tcp_port_mapping(local_port).await?,
+        ))
     }
 }
 
@@ -1161,6 +1243,102 @@ impl StunInfoCollectorTrait for StunInfoCollector {
 
         Err(Error::NotFound)
     }
+
+    async fn start_tcp_port_mapping_lease(
+        &self,
+        local_port: u16,
+        keepalive_interval: Duration,
+    ) -> Result<TcpPortMappingLease, Error> {
+        let stun_servers = self.tcp_stun_server_candidates().await;
+        if stun_servers.is_empty() {
+            return Err(Error::NotFound);
+        }
+
+        let (mut stun_server, initial_mapping, mut stream) =
+            open_tcp_port_mapping(&stun_servers, local_port).await?;
+        let local_port = stream.local_addr()?.port();
+        let (sender, receiver) = watch::channel(Some(initial_mapping));
+        let task = tokio::spawn(async move {
+            tracing::info!(
+                ?stun_server,
+                ?initial_mapping,
+                local_port,
+                keepalive_secs = keepalive_interval.as_secs(),
+                "tcp stun mapping lease started"
+            );
+
+            loop {
+                tokio::time::sleep(keepalive_interval).await;
+                if sender.is_closed() {
+                    return;
+                }
+
+                let client = TcpStunClient::new(stun_server, local_port);
+                match client.bind_request_on_stream(&mut stream).await {
+                    Ok(response) => {
+                        if let Some(mapped_addr) = response.mapped_socket_addr {
+                            sender.send_replace(Some(mapped_addr));
+                            continue;
+                        }
+                        tracing::warn!(
+                            ?stun_server,
+                            local_port,
+                            "tcp stun mapping lease response missing mapped address"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            ?stun_server,
+                            local_port,
+                            "tcp stun mapping lease keepalive failed"
+                        );
+                    }
+                }
+
+                tracing::warn!(
+                    ?stun_server,
+                    local_port,
+                    "tcp stun mapping lease lost; reconnecting"
+                );
+                sender.send_replace(None);
+
+                // Release the old four-tuple before rebinding the same local port.
+                let _ = SockRef::from(&stream).set_linger(Some(Duration::ZERO));
+                drop(stream);
+
+                loop {
+                    if sender.is_closed() {
+                        return;
+                    }
+                    match open_tcp_port_mapping(&stun_servers, local_port).await {
+                        Ok((new_stun_server, mapped_addr, new_stream)) => {
+                            stun_server = new_stun_server;
+                            stream = new_stream;
+                            sender.send_replace(Some(mapped_addr));
+                            tracing::info!(
+                                ?stun_server,
+                                ?mapped_addr,
+                                local_port,
+                                "tcp stun mapping lease restored"
+                            );
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                ?error,
+                                local_port,
+                                "tcp stun mapping lease reconnect failed"
+                            );
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(TcpPortMappingLease::new(receiver, task))
+    }
 }
 
 impl StunInfoCollector {
@@ -1204,6 +1382,34 @@ impl StunInfoCollector {
     pub fn set_tcp_stun_servers(&self, stun_servers: Vec<String>) {
         let mut g = self.tcp_stun_servers.write().unwrap();
         *g = stun_servers;
+    }
+
+    async fn tcp_stun_server_candidates(&self) -> Vec<SocketAddr> {
+        self.start_stun_routine();
+
+        let mut servers = self
+            .tcp_nat_test_result
+            .read()
+            .unwrap()
+            .clone()
+            .map(|result| result.collect_available_stun_server())
+            .unwrap_or_default();
+        servers.truncate(2);
+
+        if servers.len() < 2 {
+            let configured_servers = self.tcp_stun_servers.read().unwrap().clone();
+            let mut resolver = HostResolverIter::new(configured_servers, 2, false);
+            while let Some(addr) = resolver.next().await {
+                if !servers.contains(&addr) {
+                    servers.push(addr);
+                }
+                if servers.len() >= 2 {
+                    break;
+                }
+            }
+        }
+
+        servers
     }
 
     pub fn get_default_servers() -> Vec<String> {
@@ -1621,6 +1827,131 @@ mod tests {
         let mapped = collector.get_tcp_port_mapping(0).await.unwrap();
         assert_eq!(mapped.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(mapped.port() > 0);
+    }
+
+    #[tokio::test]
+    async fn tcp_port_mapping_lease_refreshes_on_same_connection() {
+        use stun_codec::rfc5389::attributes::XorMappedAddress;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let _server = AbortOnDropHandle::new(tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, peer_addr)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    loop {
+                        let Ok(request) = TcpStunClient::tcp_read_stun_message(
+                            &mut stream,
+                            Duration::from_secs(2),
+                        )
+                        .await
+                        else {
+                            return;
+                        };
+                        let mut response = Message::<Attribute>::new(
+                            MessageClass::SuccessResponse,
+                            BINDING,
+                            request.transaction_id(),
+                        );
+                        response.add_attribute(Attribute::XorMappedAddress(XorMappedAddress::new(
+                            peer_addr,
+                        )));
+                        let mut encoder = MessageEncoder::new();
+                        let response = encoder.encode_into_bytes(response).unwrap();
+                        if stream.write_all(response.as_slice()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        }));
+
+        let collector = StunInfoCollector::new(vec![], vec![server_addr.to_string()], vec![]);
+        let mut lease = collector
+            .start_tcp_port_mapping_lease(0, Duration::from_millis(20))
+            .await
+            .unwrap();
+        let initial_mapping = lease.current().unwrap();
+
+        let first_refresh = tokio::time::timeout(Duration::from_secs(1), lease.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let second_refresh = tokio::time::timeout(Duration::from_secs(1), lease.changed())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first_refresh, Some(initial_mapping));
+        assert_eq!(second_refresh, Some(initial_mapping));
+    }
+
+    #[tokio::test]
+    async fn tcp_port_mapping_lease_reconnects_from_same_port() {
+        use stun_codec::rfc5389::attributes::XorMappedAddress;
+        use tokio::{net::TcpListener, sync::mpsc};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let (peer_port_sender, mut peer_port_receiver) = mpsc::unbounded_channel();
+        let _server = AbortOnDropHandle::new(tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, peer_addr)) = listener.accept().await else {
+                    return;
+                };
+                peer_port_sender.send(peer_addr.port()).unwrap();
+                let request =
+                    TcpStunClient::tcp_read_stun_message(&mut stream, Duration::from_secs(2))
+                        .await
+                        .unwrap();
+                let mut response = Message::<Attribute>::new(
+                    MessageClass::SuccessResponse,
+                    BINDING,
+                    request.transaction_id(),
+                );
+                response.add_attribute(Attribute::XorMappedAddress(XorMappedAddress::new(
+                    peer_addr,
+                )));
+                let mut encoder = MessageEncoder::new();
+                let response = encoder.encode_into_bytes(response).unwrap();
+                stream.write_all(response.as_slice()).await.unwrap();
+            }
+        }));
+
+        let collector = StunInfoCollector::new(vec![], vec![server_addr.to_string()], vec![]);
+        let mut lease = collector
+            .start_tcp_port_mapping_lease(0, Duration::from_millis(20))
+            .await
+            .unwrap();
+        let initial_mapping = lease.current().unwrap();
+        let initial_port = peer_port_receiver.recv().await.unwrap();
+        assert_eq!(initial_port, initial_mapping.port());
+
+        let reconnected_port = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let port = peer_port_receiver.recv().await.unwrap();
+                if port == initial_port {
+                    return port;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(reconnected_port, initial_port);
+
+        let restored_mapping = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(mapped_addr) = lease.changed().await.unwrap() {
+                    return mapped_addr;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(restored_mapping, initial_mapping);
     }
 
     #[tokio::test]
